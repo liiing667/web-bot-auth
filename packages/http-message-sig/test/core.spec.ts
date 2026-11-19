@@ -704,6 +704,54 @@ describe("verifySignature", () => {
     }
   });
 
+  it("rejects duplicate labels split across repeated field occurrences", async () => {
+    const value = await signed();
+    const message: RequestDescriptor = {
+      ...request,
+      fields: [
+        ...request.fields,
+        { name: "signature", value: value.fields.signature },
+        { name: "Signature", value: value.fields.signature },
+        { name: "signature-input", value: value.fields.signatureInput },
+        { name: "Signature-Input", value: value.fields.signatureInput },
+      ],
+    };
+    await expect(
+      verifySignature(message, {
+        label: "sig1",
+        policy: permittedPolicy,
+        resolveVerifier: () => verifierFor(value.base),
+      })
+    ).rejects.toMatchObject({ code: SignatureErrorCode.DuplicateLabel });
+  });
+
+  it("rejects non-ASCII field content on both descriptor and native requests", async () => {
+    const descriptor: RequestDescriptor = {
+      kind: "request",
+      method: "GET",
+      targetUri: "https://example.com/",
+      fields: [{ name: "x-test", value: "caf\u00e9" }],
+    };
+    await expect(
+      createSignature(descriptor, {
+        components: ["x-test"],
+        parameters: {},
+        signer: { algorithm: "test-alg", sign: () => new Uint8Array() },
+      })
+    ).rejects.toMatchObject({ code: SignatureErrorCode.MalformedField });
+
+    const native = new Request("https://example.com/", {
+      headers: { "x-test": "caf\u00e9" },
+    });
+    await expect(
+      createSignature(native, {
+        components: ["x-test"],
+        parameters: {},
+        signer: { algorithm: "test-alg", sign: () => new Uint8Array() },
+      })
+    ).rejects.toMatchObject({ code: SignatureErrorCode.MalformedField });
+  });
+
   it("binds the claimed algorithm to the selected verifier", async () => {
     const value = await signed();
     await expect(

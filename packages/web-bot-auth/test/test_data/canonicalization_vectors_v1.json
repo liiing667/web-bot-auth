@@ -1,0 +1,165 @@
+{
+  "description": "Cross-implementation fixed vectors for RFC 9421 signature base canonicalization. Both the TypeScript (http-message-sig) and Rust (web-bot-auth) implementations must derive the exact same canonical base, or fail with the same error conclusion, for every vector.",
+  "fields": [
+    {
+      "name": "single-field-is-trimmed",
+      "occurrences": [
+        {
+          "name": "x-test",
+          "value": "   hello, world   "
+        }
+      ],
+      "components": ["x-test"],
+      "base": "\"x-test\": hello, world\n\"@signature-params\": (\"x-test\")"
+    },
+    {
+      "name": "single-field-obsolete-line-folding",
+      "occurrences": [
+        {
+          "name": "x-test",
+          "value": "first\r\n second\r\n\tthird"
+        }
+      ],
+      "components": ["x-test"],
+      "base": "\"x-test\": first second third\n\"@signature-params\": (\"x-test\")"
+    },
+    {
+      "name": "duplicate-headers-are-ordered-and-joined",
+      "occurrences": [
+        {
+          "name": "x-test",
+          "value": " first "
+        },
+        {
+          "name": "X-Test",
+          "value": "\tsecond\t"
+        }
+      ],
+      "components": ["x-test"],
+      "base": "\"x-test\": first, second\n\"@signature-params\": (\"x-test\")"
+    },
+    {
+      "name": "duplicate-headers-with-line-folding",
+      "occurrences": [
+        {
+          "name": "x-test",
+          "value": "a\r\n b"
+        },
+        {
+          "name": "X-Test",
+          "value": "  c  "
+        }
+      ],
+      "components": ["x-test"],
+      "base": "\"x-test\": a b, c\n\"@signature-params\": (\"x-test\")"
+    },
+    {
+      "name": "field-name-case-is-lowercased-in-the-base",
+      "occurrences": [
+        {
+          "name": "X-Custom",
+          "value": "value"
+        }
+      ],
+      "components": ["X-Custom"],
+      "base": "\"x-custom\": value\n\"@signature-params\": (\"x-custom\")"
+    },
+    {
+      "name": "tab-inside-field-content-is-preserved",
+      "occurrences": [
+        {
+          "name": "x-test",
+          "value": "a\tb"
+        }
+      ],
+      "components": ["x-test"],
+      "base": "\"x-test\": a\tb\n\"@signature-params\": (\"x-test\")"
+    },
+    {
+      "name": "non-ascii-field-content-is-rejected",
+      "occurrences": [
+        {
+          "name": "x-test",
+          "value": "café"
+        }
+      ],
+      "components": ["x-test"],
+      "error": "non-ascii"
+    },
+    {
+      "name": "non-ascii-field-content-in-duplicate-header-is-rejected",
+      "occurrences": [
+        {
+          "name": "x-test",
+          "value": "first"
+        },
+        {
+          "name": "X-Test",
+          "value": "café"
+        }
+      ],
+      "components": ["x-test"],
+      "error": "non-ascii"
+    },
+    {
+      "name": "control-character-in-field-content-is-rejected",
+      "occurrences": [
+        {
+          "name": "x-test",
+          "value": "a\u0001b"
+        }
+      ],
+      "components": ["x-test"],
+      "error": "invalid-ascii"
+    }
+  ],
+  "dictionaries": [
+    {
+      "name": "duplicate-signature-labels-are-rejected",
+      "field": "signature",
+      "values": ["sig1=:AAEC:", "sig1=:Aw==:"],
+      "error": "duplicate-label"
+    },
+    {
+      "name": "duplicate-signature-input-labels-are-rejected",
+      "field": "signature-input",
+      "values": ["sig1=(\"@authority\")", "sig1=(\"@method\")"],
+      "error": "duplicate-label"
+    },
+    {
+      "name": "duplicate-signature-parameters-are-rejected",
+      "field": "signature-input",
+      "values": ["sig1=(\"@authority\");created=1;created=2"],
+      "error": "duplicate-parameter"
+    },
+    {
+      "name": "duplicate-component-parameters-are-rejected",
+      "field": "signature-input",
+      "values": ["sig1=(\"example\";key=\"a\";key=\"b\")"],
+      "error": "duplicate-parameter"
+    },
+    {
+      "name": "malformed-signature-dictionary-is-rejected",
+      "field": "signature",
+      "values": ["sig1=not-a-byte-sequence"],
+      "error": "malformed"
+    }
+  ],
+  "components": [
+    {
+      "name": "duplicate-covered-components-are-rejected",
+      "signature_input": "sig1=(\"@authority\" \"@authority\")",
+      "error": "duplicate-component"
+    },
+    {
+      "name": "equivalent-covered-components-regardless-of-parameter-order-are-rejected",
+      "signature_input": "sig1=(\"example\";key=\"a\";req \"example\";req;key=\"a\")",
+      "error": "duplicate-component"
+    },
+    {
+      "name": "non-lowercase-component-identifiers-are-rejected",
+      "signature_input": "sig1=(\"@Method\")",
+      "error": "malformed-component"
+    }
+  ]
+}

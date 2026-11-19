@@ -23,7 +23,30 @@ use crate::components::{self, CoveredComponent, HTTPField};
 use crate::keyring::{Algorithm, KeyRing, PreparedKey};
 
 static OBSOLETE_LINE_FOLDING: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\s*\r\n\s+").unwrap());
+    LazyLock::new(|| Regex::new(r"\r\n[\t ]+").unwrap());
+
+/// Canonicalize an HTTP field value for inclusion in a signature base.
+///
+/// This mirrors RFC 9421 Section 2.1.3 and the TypeScript implementation:
+/// obsolete line folding (`CRLF` followed by one or more spaces or tabs) is
+/// replaced with a single space, then leading and trailing spaces and tabs are
+/// removed. The result must be valid ASCII field content (VCHAR, SP and HTAB);
+/// obs-text and other control characters are rejected so both implementations
+/// fail closed with the same error conclusion.
+fn canonicalize_field_value(value: &str) -> Result<String, ImplementationError> {
+    let replaced = OBSOLETE_LINE_FOLDING.replace_all(value.as_bytes(), b" ");
+    let normalized = String::from_utf8(replaced.into_owned())
+        .map_err(|_| ImplementationError::NonAsciiContentFound)?;
+    let trimmed = normalized.trim_matches(|character| character == ' ' || character == '\t');
+    let is_valid_field_content = trimmed
+        .chars()
+        .all(|character| matches!(character, '\t' | '\x20'..='\x7e'));
+    if is_valid_field_content {
+        Ok(trimmed.to_owned())
+    } else {
+        Err(ImplementationError::NonAsciiContentFound)
+    }
+}
 
 /// The component parameters associated with the signature in `Signature-Input`
 #[derive(Clone, Debug)]
@@ -151,6 +174,26 @@ struct SignatureBaseBuilder {
     parameters: SignatureParams,
 }
 
+/// Serializes a covered component into its canonical identity, ignoring the
+/// order of component parameters. This matches the TypeScript implementation,
+/// which treats two identifiers as equivalent when only parameter order
+/// differs.
+fn canonical_component_identity(
+    component: &CoveredComponent,
+) -> Result<String, ImplementationError> {
+    let mut item = match component {
+        CoveredComponent::HTTP(http) => sfv::Item::try_from(HTTPField {
+            name: http.name.to_ascii_lowercase(),
+            parameters: http.parameters.clone(),
+        })?,
+        CoveredComponent::Derived(derived) => sfv::Item::try_from(derived.clone())?,
+    };
+    let mut ordered = item.params.into_iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+    item.params = ordered.into_iter().collect();
+    Ok(item.serialize())
+}
+
 impl TryFrom<sfv::InnerList> for SignatureBaseBuilder {
     type Error = ImplementationError;
 
@@ -161,7 +204,16 @@ impl TryFrom<sfv::InnerList> for SignatureBaseBuilder {
             .map(|item| (*item).clone().try_into())
             .collect::<Result<Vec<CoveredComponent>, ImplementationError>>()?;
         // RFC 9421 Section 2.5, step 2.1: each component identifier occurs only once.
-        if IndexSet::<&CoveredComponent>::from_iter(&components).len() != components.len() {
+        let mut identities = IndexSet::new();
+        for component in &components {
+            let identity = canonical_component_identity(component)?;
+            if !identities.insert(identity) {
+                return Err(ImplementationError::ParsingError(
+                    "duplicate covered component".to_string(),
+                ));
+            }
+        }
+        if identities.len() != components.len() {
             return Err(ImplementationError::ParsingError(
                 "duplicate covered component".to_string(),
             ));
@@ -185,23 +237,16 @@ impl SignatureBaseBuilder {
                 self.components
                     .into_iter()
                     .map(|component| match message.lookup_component(&component) {
-                        v if v.len() == 1 => Ok((component, v[0].to_owned())),
+                        v if v.len() == 1 => {
+                            // RFC 9421 Section 2.1.3 applies even when a field occurs once.
+                            let normalized = canonicalize_field_value(&v[0])?;
+                            Ok((component, normalized))
+                        }
                         v if v.len() > 1 && matches!(component, CoveredComponent::HTTP(_)) => {
                             let mut register: Vec<String> = vec![];
-
                             for header_value in v.into_iter() {
-                                register.push(
-                                    // replace leading / trailing whitespace and obsolete line folding,
-                                    // per HTTP message signature spec
-                                    String::from_utf8(
-                                        OBSOLETE_LINE_FOLDING
-                                            .replace_all(header_value.as_bytes().trim_ascii(), b" ")
-                                            .into_owned(),
-                                    )
-                                    .map_err(|_| ImplementationError::NonAsciiContentFound)?,
-                                );
+                                register.push(canonicalize_field_value(&header_value)?);
                             }
-
                             Ok((component, register.join(", ")))
                         }
                         _ => Err(ImplementationError::LookupError(component)),
@@ -232,7 +277,12 @@ impl SignatureBase {
 
         for (component, serialized_value) in self.components {
             let sfv_item = match component {
-                CoveredComponent::HTTP(http) => sfv::Item::try_from(http)?,
+                CoveredComponent::HTTP(http) => sfv::Item::try_from(HTTPField {
+                    // HTTP field names are case-insensitive and the signature base
+                    // always uses the lowercase form, matching the TypeScript side.
+                    name: http.name.to_ascii_lowercase(),
+                    parameters: http.parameters,
+                })?,
                 CoveredComponent::Derived(derived) => sfv::Item::try_from(derived)?,
             };
 
@@ -513,32 +563,85 @@ impl<'de> sfv::visitor::DictionaryVisitor<'de> for CountingDictionary {
     }
 }
 
+/// Counts top-level `;` parameter separators outside quoted strings, matching
+/// the strict structured-field parser on the TypeScript side. A lower count
+/// after parsing means duplicate parameters were silently overwritten.
+fn raw_parameter_count(input: &str) -> usize {
+    let mut count = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for character in input.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if quoted && character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if character == '"' {
+            quoted = !quoted;
+            continue;
+        }
+        if !quoted && character == ';' {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Counts every parsed parameter across the dictionary, including those on
+/// inner list members. It is the parsed counterpart to [`raw_parameter_count`].
+fn parsed_parameter_count(dictionary: &sfv::Dictionary) -> usize {
+    let mut count = 0;
+    for entry in dictionary.values() {
+        match entry {
+            sfv::ListEntry::Item(item) => count += item.params.len(),
+            sfv::ListEntry::InnerList(inner_list) => {
+                count += inner_list.params.len();
+                for item in &inner_list.items {
+                    count += item.params.len();
+                }
+            }
+        }
+    }
+    count
+}
+
 /// Parses and merges every value of the `Signature-Input` or `Signature` field.
 /// RFC 9421 Sections 4.1 and 4.2: labels are unique across all field values.
 fn parse_signature_dictionary(
     message: &impl SignedMessage,
     field: &str,
 ) -> Result<sfv::Dictionary, ImplementationError> {
-    let (dictionary, labels) = message
-        .lookup_component(&CoveredComponent::HTTP(HTTPField {
-            name: field.to_ascii_lowercase(),
-            parameters: components::HTTPFieldParametersSet(vec![]),
-        }))
-        .into_iter()
-        .filter_map(|value| {
-            sfv::Parser::new(&value)
-                .parse_dictionary_with_visitor(CountingDictionary::default())
-                .ok()
-        })
-        .reduce(|(mut acc, count), (dictionary, more)| {
-            acc.extend(dictionary);
-            (acc, count + more)
-        })
-        .ok_or_else(|| {
-            ImplementationError::ParsingError(format!(
-                "No validly-formatted `{field}` headers found"
-            ))
-        })?;
+    let mut dictionary: sfv::Dictionary = sfv::Dictionary::new();
+    let mut labels = 0;
+    let header_values = message.lookup_component(&CoveredComponent::HTTP(HTTPField {
+        name: field.to_ascii_lowercase(),
+        parameters: components::HTTPFieldParametersSet(vec![]),
+    }));
+    if header_values.is_empty() {
+        return Err(ImplementationError::ParsingError(format!(
+            "No validly-formatted `{field}` headers found"
+        )));
+    }
+    for value in header_values {
+        let (parsed, more_labels) = sfv::Parser::new(&value)
+            .parse_dictionary_with_visitor(CountingDictionary::default())
+            .map_err(|error| {
+                ImplementationError::ParsingError(format!("Malformed `{field}` header: {error}"))
+            })?;
+        // Duplicate parameters are last-wins per RFC 9651; reject them so the
+        // same malformed input cannot produce a valid base here while the
+        // TypeScript implementation rejects it.
+        if raw_parameter_count(&value) != parsed_parameter_count(&parsed) {
+            return Err(ImplementationError::ParsingError(format!(
+                "`{field}` header contains duplicate parameters"
+            )));
+        }
+        dictionary.extend(parsed);
+        labels += more_labels;
+    }
     if dictionary.len() != labels {
         return Err(ImplementationError::ParsingError(format!(
             "duplicate label in `{field}`"
@@ -674,6 +777,7 @@ mod tests {
 
     use super::*;
     use crate::components::{DerivedComponent, HTTPField, HTTPFieldParametersSet};
+    use serde::Deserialize;
 
     struct StandardTestVector {}
 
@@ -844,6 +948,62 @@ mod tests {
                 assert!(matches!(err, ImplementationError::ParsingError(_)));
             }
         }
+    }
+
+    #[test]
+    fn test_parsing_rejects_malformed_header_lines_instead_of_ignoring_them() {
+        // A malformed field line must fail closed: previously it was silently
+        // dropped, allowing the remaining lines to be treated as the message.
+        struct Malformed;
+        impl SignedMessage for Malformed {
+            fn lookup_component(&self, name: &CoveredComponent) -> Vec<String> {
+                let values = (StandardTestVector {}).lookup_component(name);
+                match name {
+                    CoveredComponent::HTTP(HTTPField { name, .. }) if name == "signature" => {
+                        vec!["sig1=:unterminated".to_owned(), values[0].clone()]
+                    }
+                    _ => values,
+                }
+            }
+        }
+        let err = MessageVerifier::parse(&Malformed, |(_, _)| true).unwrap_err();
+        assert!(matches!(err, ImplementationError::ParsingError(_)));
+    }
+
+    #[test]
+    fn test_single_field_value_is_canonicalized_like_repeated_values() {
+        struct Folding {
+            value: String,
+        }
+        impl SignedMessage for Folding {
+            fn lookup_component(&self, name: &CoveredComponent) -> Vec<String> {
+                let values = (StandardTestVector {}).lookup_component(name);
+                match name {
+                    CoveredComponent::HTTP(HTTPField { name, .. }) if name == "x-folded" => {
+                        vec![self.value.clone()]
+                    }
+                    _ => values,
+                }
+            }
+        }
+        let message = Folding {
+            value: "  first\r\n second\t".to_owned(),
+        };
+        let component: CoveredComponent = sfv::Parser::new(r#""x-folded""#)
+            .parse_item::<sfv::Item>()
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let builder = SignatureBaseBuilder {
+            components: vec![component],
+            parameters: SignatureParams::from(sfv::Parameters::new()),
+        };
+        let base = builder.into_signature_base(&message).unwrap();
+        let (ascii, _) = base.into_ascii().unwrap();
+        assert_eq!(
+            ascii,
+            "\"x-folded\": first second\n\"@signature-params\": (\"x-folded\")"
+        );
     }
 
     #[test]
@@ -1114,5 +1274,187 @@ mod tests {
             base,
             "\"@path\": /%7Esmith\n\"@query\": ?baz=bat%7Eman\n\"@signature-params\": (\"@path\" \"@query\")"
         );
+    }
+
+    /// A message assembled from a cross-implementation canonicalization fixed
+    /// vector. Header occurrences keep their original casing and whitespace so
+    /// the canonicalizer, rather than the test harness, does the normalization.
+    #[derive(Default)]
+    struct VectorMessage {
+        fields: Vec<(String, String)>,
+        authority: Option<String>,
+    }
+
+    impl SignedMessage for VectorMessage {
+        fn lookup_component(&self, name: &CoveredComponent) -> Vec<String> {
+            match name {
+                CoveredComponent::HTTP(HTTPField { name: wanted, .. }) => self
+                    .fields
+                    .iter()
+                    .filter(|(field_name, _)| field_name.eq_ignore_ascii_case(wanted))
+                    .map(|(_, value)| value.clone())
+                    .collect(),
+                CoveredComponent::Derived(DerivedComponent::Authority { .. }) => {
+                    self.authority.clone().into_iter().collect()
+                }
+                _ => vec![],
+            }
+        }
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct CanonicalizationVectors {
+        fields: Vec<FieldVector>,
+        dictionaries: Vec<DictionaryVector>,
+        components: Vec<ComponentVector>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct FieldOccurrence {
+        name: String,
+        value: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct FieldVector {
+        name: String,
+        occurrences: Vec<FieldOccurrence>,
+        components: Vec<String>,
+        base: Option<String>,
+        error: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct DictionaryVector {
+        name: String,
+        field: String,
+        values: Vec<String>,
+        error: Option<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ComponentVector {
+        name: String,
+        signature_input: String,
+        error: Option<String>,
+    }
+
+    fn canonicalization_vectors() -> CanonicalizationVectors {
+        serde_json::from_str(include_str!(
+            "../../../packages/web-bot-auth/test/test_data/canonicalization_vectors_v1.json"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn canonicalization_fixed_vectors_match_typescript() {
+        let vectors = canonicalization_vectors();
+        for vector in vectors.fields {
+            let mut message = VectorMessage::default();
+            for occurrence in &vector.occurrences {
+                message
+                    .fields
+                    .push((occurrence.name.clone(), occurrence.value.clone()));
+            }
+            let items = vector
+                .components
+                .iter()
+                .map(|component| {
+                    let quoted = format!("\"{component}\"");
+                    sfv::Parser::new(&quoted).parse_item::<sfv::Item>().unwrap()
+                })
+                .collect::<Vec<_>>();
+            let covered = items
+                .into_iter()
+                .map(CoveredComponent::try_from)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let builder = SignatureBaseBuilder {
+                components: covered,
+                parameters: SignatureParams::from(sfv::Parameters::new()),
+            };
+            let outcome = builder
+                .into_signature_base(&message)
+                .and_then(|base| base.into_ascii().map(|(ascii, _)| ascii));
+            match (vector.error, outcome) {
+                (Some(_), Err(_)) => {}
+                (None, Ok(actual)) => {
+                    assert_eq!(
+                        actual,
+                        vector.base.unwrap(),
+                        "field vector `{}`",
+                        vector.name
+                    );
+                }
+                (Some(kind), Ok(actual)) => panic!(
+                    "field vector `{}` expected error `{kind}` but got base `{actual}`",
+                    vector.name
+                ),
+                (None, Err(error)) => panic!(
+                    "field vector `{}` expected a base but got `{error}`",
+                    vector.name
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn dictionary_fixed_vectors_share_the_typescript_error_conclusions() {
+        let vectors = canonicalization_vectors();
+        for vector in vectors.dictionaries {
+            let mut message = VectorMessage::default();
+            for value in &vector.values {
+                message.fields.push((vector.field.clone(), value.clone()));
+            }
+            let counterpart = if vector.field == "signature" {
+                ("signature-input", r#"sig1=("@authority")"#)
+            } else {
+                ("signature", "sig1=:AAEC:")
+            };
+            message
+                .fields
+                .push((counterpart.0.to_owned(), counterpart.1.to_owned()));
+            let error = MessageVerifier::parse(&message, |(_, _)| true).unwrap_err();
+            match vector.error.as_deref() {
+                Some("duplicate-label") => {
+                    assert!(
+                        matches!(&error, ImplementationError::ParsingError(message) if message.contains("duplicate label")),
+                        "vector `{}` got {error:?}",
+                        vector.name
+                    );
+                }
+                Some("duplicate-parameter") => {
+                    assert!(
+                        matches!(&error, ImplementationError::ParsingError(message) if message.contains("duplicate parameters")),
+                        "vector `{}` got {error:?}",
+                        vector.name
+                    );
+                }
+                _ => assert!(matches!(&error, ImplementationError::ParsingError(_))),
+            }
+        }
+    }
+
+    #[test]
+    fn covered_component_fixed_vectors_share_the_typescript_error_conclusions() {
+        let vectors = canonicalization_vectors();
+        for vector in vectors.components {
+            let message = VectorMessage {
+                fields: vec![
+                    ("signature-input".to_owned(), vector.signature_input),
+                    ("signature".to_owned(), "sig1=:AAEC:".to_owned()),
+                ],
+                authority: None,
+            };
+            let error = MessageVerifier::parse(&message, |(_, _)| true).unwrap_err();
+            // Every shared component vector is a rejection vector; mirror the
+            // TypeScript error category rather than only asserting failure.
+            assert!(vector.error.is_some(), "vector `{}`", vector.name);
+            assert!(
+                matches!(error, ImplementationError::ParsingError(_)),
+                "vector `{}` got {error:?}",
+                vector.name
+            );
+        }
     }
 }

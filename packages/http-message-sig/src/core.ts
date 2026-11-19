@@ -294,7 +294,11 @@ function normalizeComponents(
 
 function fieldsFromHeaders(headers: Headers): readonly FieldOccurrence[] {
   const fields: FieldOccurrence[] = [];
-  headers.forEach((value, name) => fields.push(Object.freeze({ name, value })));
+  headers.forEach((value, name) => {
+    const normalized = normalizeFieldValue(value);
+    validateAscii(normalized, `Field ${name}`);
+    fields.push(Object.freeze({ name, value: normalized }));
+  });
   return Object.freeze(fields);
 }
 
@@ -660,11 +664,25 @@ export function createSignatureSync(
   });
 }
 
-function topLevelMemberCount(input: string): number {
-  let count = input.trim() === "" ? 0 : 1;
+function rawDictionaryLabelCount(input: string): number {
+  let count = 0;
   let depth = 0;
   let quoted = false;
   let escaped = false;
+  let expectingLabel = true;
+  let labelBuffer = "";
+  // RFC 8941 Section 3.1.2: keys start with "*" or lowercase alpha, then
+  // lowercase alpha, digits, "_", ".", "-", "*".
+  const isKeyStart = (character: string) =>
+    character === "*" || /[a-z]/.test(character);
+  const isKeyCharacter = (character: string) =>
+    isKeyStart(character) || /[a-z0-9_.*-]/.test(character);
+  const countLabel = () => {
+    if (labelBuffer !== "") {
+      count += 1;
+      labelBuffer = "";
+    }
+  };
   for (const character of input) {
     if (escaped) {
       escaped = false;
@@ -678,8 +696,23 @@ function topLevelMemberCount(input: string): number {
     if (quoted) continue;
     if (character === "(") depth += 1;
     if (character === ")") depth -= 1;
-    if (character === "," && depth === 0) count += 1;
+    if (depth !== 0) continue;
+    if (expectingLabel && labelBuffer === "" && !isKeyStart(character)) {
+      continue;
+    }
+    if (expectingLabel && isKeyCharacter(character)) {
+      labelBuffer += character;
+    } else if (character === ";" || character === "=") {
+      countLabel();
+      expectingLabel = false;
+    } else if (character === ",") {
+      countLabel();
+      expectingLabel = true;
+    } else {
+      expectingLabel = false;
+    }
   }
+  countLabel();
   return count;
 }
 
@@ -756,7 +789,7 @@ function parseRfc8941Dictionary(input: string, name: string): Dictionary {
 
 function parseStrictDictionary(input: string, name: string): Dictionary {
   const dictionary = parseRfc8941Dictionary(input, name);
-  if (topLevelMemberCount(input) !== dictionary.size) {
+  if (rawDictionaryLabelCount(input) !== dictionary.size) {
     return fail(
       SignatureErrorCode.DuplicateLabel,
       `${name} has duplicate labels`
@@ -947,8 +980,39 @@ export function appendSignature(
   return output;
 }
 
-function getRequiredField(snapshot: MessageSnapshot, name: string): string {
-  return extractField(snapshot, name, false);
+function getRequiredFieldOccurrences(
+  snapshot: MessageSnapshot,
+  name: string
+): readonly string[] {
+  const values: string[] = [];
+  for (const field of snapshot.fields) {
+    if (field.name === name) values.push(normalizeFieldValue(field.value));
+  }
+  if (values.length === 0) {
+    return fail(SignatureErrorCode.MissingField, `Missing field ${name}`);
+  }
+  return Object.freeze(values);
+}
+
+function parseOccurrenceDictionary(
+  occurrences: readonly string[],
+  parse: (input: string) => Dictionary,
+  name: string
+): Dictionary {
+  const merged: Dictionary = new Map();
+  for (const occurrence of occurrences) {
+    const dictionary = parse(occurrence);
+    for (const label of dictionary.keys()) {
+      if (merged.has(label)) {
+        return fail(
+          SignatureErrorCode.DuplicateLabel,
+          `${name} has duplicate labels`
+        );
+      }
+    }
+    for (const entry of dictionary) merged.set(entry[0], entry[1]);
+  }
+  return merged;
 }
 
 function assertPolicyCoverage<V extends Verifier>(
@@ -1010,10 +1074,24 @@ export async function verifySignature<V extends Verifier>(
   options: VerifySignatureOptions<V>
 ): Promise<VerifiedSignature<V>> {
   const snapshot = snapshotMessage(message);
-  const signatureHeader = getRequiredField(snapshot, "signature");
-  const inputHeader = getRequiredField(snapshot, "signature-input");
-  const signatures = parseSignatureDictionary(signatureHeader);
-  const inputs = parseSignatureInputDictionary(inputHeader);
+  const signatureOccurrences = getRequiredFieldOccurrences(
+    snapshot,
+    "signature"
+  );
+  const inputOccurrences = getRequiredFieldOccurrences(
+    snapshot,
+    "signature-input"
+  );
+  const signatures = parseOccurrenceDictionary(
+    signatureOccurrences,
+    parseSignatureDictionary,
+    "Signature"
+  );
+  const inputs = parseOccurrenceDictionary(
+    inputOccurrences,
+    parseSignatureInputDictionary,
+    "Signature-Input"
+  );
   const label = selectedLabel(signatures, inputs, options.label);
   const inputMember = inputs.get(label);
   const signatureMember = signatures.get(label);
