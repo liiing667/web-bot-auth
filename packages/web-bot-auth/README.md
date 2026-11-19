@@ -17,6 +17,7 @@ TypeScript helpers for Web Bot Auth, as described in [draft-meunier-webbotauth-h
 ## Features
 
 - Web Bot Auth request signing and verification policy
+- Request method and body integrity through `@method` and `Content-Digest`
 - Ed25519 and RSA-PSS/SHA-512 JWK signers and verifiers
 - `Signature-Agent`, registry, and Signature Agent Card parsers
 - TypeScript types
@@ -70,6 +71,46 @@ const signedRequest = new Request("https://example.com", {
 });
 ```
 
+### Signing a request body
+
+Requests that carry a body must bind it to the signature. Pass the exact
+bytes sent on the wire as `body`; `sign` computes an RFC 9530
+`Content-Digest` with SHA-256, adds the header to the signed message, and
+covers both `@method` and `content-digest`. The header value is returned as
+`contentDigest` so it can be attached to the outgoing request.
+
+```typescript
+import { sign } from "web-bot-auth";
+
+const body = JSON.stringify({ hello: "world" });
+const request = new Request("https://example.com/resource", {
+  method: "POST",
+});
+const fields = await sign(request, {
+  signer,
+  created: now,
+  expires: new Date(now.getTime() + 300_000),
+  body,
+});
+// Signature-Input covers ("@authority" "@method" "content-digest" ...)
+const signedRequest = new Request(request, {
+  method: "POST",
+  headers: {
+    "Content-Digest": fields.contentDigest,
+    Signature: fields.signature,
+    "Signature-Input": fields.signatureInput,
+  },
+  body,
+});
+```
+
+`signSync` cannot compute a digest, so passing `body` to it fails; use the
+asynchronous `sign`. `createContentDigest` and `verifyContentDigest` are also
+exported when the digest must be handled separately. Only `sha-256` and
+`sha-512` are accepted: missing digests, weak or unknown algorithms such as
+`md5` or `sha-1`, malformed fields, and digests that do not match the body
+all fail verification.
+
 ### Verifying
 
 ```typescript
@@ -104,6 +145,22 @@ const authenticated = await verify(signedRequest, {
   validate: ({ nonce }) => {
     // Atomically reject a nonce already present in your replay cache.
   },
+});
+```
+
+For `POST`, `PUT`, and `PATCH` requests, pass the received bytes as `body`.
+Verification then requires the signature to cover bare `@method` and
+`content-digest`, requires a `Content-Digest` header, and recomputes the
+digest before the signature is checked. A rewritten body, a deleted digest,
+a weak digest algorithm, or a changed method therefore fails before key
+resolution completes. Bodyless requests keep the legacy behaviour and do not
+require a digest.
+
+```typescript
+const body = await request.text();
+await verify(request, {
+  resolver: () => verifier,
+  body,
 });
 ```
 

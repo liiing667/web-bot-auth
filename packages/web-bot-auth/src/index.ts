@@ -1,5 +1,6 @@
 import {
   component,
+  componentIdentity,
   createSignature,
   createSignatureSync,
   SignatureError,
@@ -16,6 +17,15 @@ import {
   type Verifier,
 } from "http-message-sig";
 import { jwkThumbprint as jwkToKeyID } from "jsonwebkey-thumbprint";
+import {
+  CONTENT_DIGEST_ALGORITHMS,
+  CONTENT_DIGEST_HEADER,
+  createContentDigest,
+  verifyContentDigest,
+  type ContentDigest,
+  type ContentDigestAlgorithm,
+  type RequestBody,
+} from "./digest";
 import {
   parseRegistry,
   parseSignatureAgentCard,
@@ -47,6 +57,19 @@ export const SIGNATURE_AGENT_HEADER = "signature-agent";
 export const HTTP_MESSAGE_SIGNATURES_DIRECTORY =
   "/.well-known/http-message-signatures-directory";
 export const NONCE_LENGTH_IN_BYTES = 64;
+export const BODY_METHODS = Object.freeze(["POST", "PUT", "PATCH"] as const);
+
+const bodyMethods = new Set<string>(BODY_METHODS);
+
+export {
+  CONTENT_DIGEST_ALGORITHMS,
+  CONTENT_DIGEST_HEADER,
+  createContentDigest,
+  verifyContentDigest,
+  type ContentDigest,
+  type ContentDigestAlgorithm,
+  type RequestBody,
+};
 
 export type WebBotAlgorithm = "ed25519" | "rsa-pss-sha512";
 
@@ -74,10 +97,15 @@ export interface SignOptions {
   readonly signatureAgentKey?: string;
   readonly target?: "@authority" | "@target-uri";
   readonly additionalComponents?: readonly SignatureComponent[];
+  readonly body?: RequestBody;
 }
 
 export interface SignSyncOptions extends Omit<SignOptions, "signer"> {
   readonly signer: WebBotSignerSync;
+}
+
+export interface SignedRequestFields extends SignatureFields {
+  readonly contentDigest?: string;
 }
 
 export interface UntrustedWebBotSignatureCandidate {
@@ -106,6 +134,7 @@ export interface VerifyOptions<V extends WebBotVerifier = WebBotVerifier> {
   readonly maxAge?: number;
   readonly clockSkew?: number;
   readonly now?: Date;
+  readonly body?: RequestBody;
   readonly validate?: (
     signature: VerifiedWebBotSignature<V>
   ) => boolean | void | Promise<boolean | void>;
@@ -212,6 +241,41 @@ function hasExactBareTarget(
   );
 }
 
+function hasBareComponent(
+  components: readonly ComponentDescriptor[],
+  name: string
+): boolean {
+  return components.some(
+    (descriptor) =>
+      descriptor.name === name &&
+      Object.keys(descriptor.parameters).length === 0
+  );
+}
+
+function requestMethod(request: Request | RequestDescriptor): string {
+  return request.method;
+}
+
+function withContentDigestHeader(
+  request: Request | RequestDescriptor,
+  contentDigest: string
+): Request | RequestDescriptor {
+  if ("kind" in request) {
+    return Object.freeze({
+      ...request,
+      fields: Object.freeze([
+        ...request.fields.filter(
+          (field) => field.name !== CONTENT_DIGEST_HEADER
+        ),
+        Object.freeze({ name: CONTENT_DIGEST_HEADER, value: contentDigest }),
+      ]),
+    });
+  }
+  const headers = new Headers(request.headers);
+  headers.set(CONTENT_DIGEST_HEADER, contentDigest);
+  return new Request(request, { headers });
+}
+
 function verifiedSignatureAgent(
   request: Request | RequestDescriptor,
   components: readonly ComponentDescriptor[]
@@ -255,7 +319,8 @@ function signingOptions(
   request: Request | RequestDescriptor,
   options: Omit<SignOptions, "signer"> & {
     readonly signer: Pick<WebBotSigner, "algorithm" | "keyid">;
-  }
+  },
+  boundComponents: readonly SignatureComponent[] = []
 ) {
   if (
     options.signer.algorithm !== "ed25519" &&
@@ -279,7 +344,18 @@ function signingOptions(
   if (agent !== undefined) {
     components.push(agent.component);
   }
-  components.push(...(options.additionalComponents ?? []));
+  for (const component of boundComponents) {
+    const identity = componentIdentity(component);
+    if (components.every((value) => componentIdentity(value) !== identity)) {
+      components.push(component);
+    }
+  }
+  for (const component of options.additionalComponents ?? []) {
+    const identity = componentIdentity(component);
+    if (components.every((value) => componentIdentity(value) !== identity)) {
+      components.push(component);
+    }
+  }
   return {
     label,
     components,
@@ -297,17 +373,32 @@ function signingOptions(
 export async function sign(
   request: Request | RequestDescriptor,
   options: SignOptions
-): Promise<SignatureFields> {
-  return createSignature(request, {
-    ...signingOptions(request, options),
+): Promise<SignedRequestFields> {
+  let signedRequest = request;
+  let contentDigest: string | undefined;
+  const boundComponents: SignatureComponent[] = [];
+  if (options.body !== undefined) {
+    const digest = await createContentDigest(options.body);
+    contentDigest = digest.value;
+    signedRequest = withContentDigestHeader(request, digest.value);
+    boundComponents.push("@method", CONTENT_DIGEST_HEADER);
+  }
+  const fields = await createSignature(signedRequest, {
+    ...signingOptions(signedRequest, options, boundComponents),
     signer: options.signer,
   });
+  return Object.freeze({ ...fields, contentDigest });
 }
 
 export function signSync(
   request: Request | RequestDescriptor,
   options: SignSyncOptions
-): SignatureFields {
+): SignedRequestFields {
+  if (options.body !== undefined) {
+    return policyError(
+      "signSync cannot cover a request body; use sign for Content-Digest"
+    );
+  }
   return createSignatureSync(request, {
     ...signingOptions(request, options),
     signer: options.signer,
@@ -316,7 +407,8 @@ export function signSync(
 
 function profileCandidate(
   request: Request | RequestDescriptor,
-  candidate: UntrustedSignatureCandidate
+  candidate: UntrustedSignatureCandidate,
+  requireBodyIntegrity: boolean
 ): UntrustedWebBotSignatureCandidate {
   const { algorithm, parameters, components } = candidate;
   if (
@@ -345,8 +437,33 @@ function profileCandidate(
       "signature must cover bare @authority or bare @target-uri"
     );
   }
+  if (requireBodyIntegrity) {
+    if (!hasBareComponent(components, "@method")) {
+      return policyError(
+        "requests with a body must have @method covered by the signature"
+      );
+    }
+    if (!hasBareComponent(components, CONTENT_DIGEST_HEADER)) {
+      return policyError(
+        `requests with a body must have ${CONTENT_DIGEST_HEADER} covered by the signature`
+      );
+    }
+  }
   const agent = verifiedSignatureAgent(request, components);
   return Object.freeze({ keyid, algorithm, signatureAgent: agent });
+}
+
+async function assertBodyIntegrity(
+  request: Request | RequestDescriptor,
+  body: RequestBody
+): Promise<void> {
+  const contentDigest = requestHeader(request, CONTENT_DIGEST_HEADER);
+  if (contentDigest === undefined) {
+    return policyError(
+      `requests with a body must include a ${CONTENT_DIGEST_HEADER} header`
+    );
+  }
+  await verifyContentDigest(body, contentDigest);
 }
 
 export async function verify<V extends WebBotVerifier>(
@@ -355,6 +472,15 @@ export async function verify<V extends WebBotVerifier>(
 ): Promise<VerifiedWebBotSignature<V>> {
   const algorithms = options.algorithms ?? ["ed25519", "rsa-pss-sha512"];
   const now = seconds(options.now ?? new Date(), "now");
+  const method = requestMethod(request);
+  const requiresBodyIntegrity =
+    options.body !== undefined || bodyMethods.has(method.toUpperCase());
+  if (requiresBodyIntegrity && options.body === undefined) {
+    return policyError(`${method} requests require a body to verify integrity`);
+  }
+  if (requiresBodyIntegrity) {
+    await assertBodyIntegrity(request, options.body as RequestBody);
+  }
   let selected: UntrustedWebBotSignatureCandidate | undefined;
   const verified = await verifySignature(request, {
     label: options.label,
@@ -367,7 +493,11 @@ export async function verify<V extends WebBotVerifier>(
       now,
     },
     async resolveVerifier(candidate) {
-      const profile = profileCandidate(request, candidate);
+      const profile = profileCandidate(
+        request,
+        candidate,
+        requiresBodyIntegrity
+      );
       selected = profile;
       const verifier = await options.resolver(profile);
       if (verifier.keyid !== profile.keyid) {
