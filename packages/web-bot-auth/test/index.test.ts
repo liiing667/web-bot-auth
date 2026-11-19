@@ -475,6 +475,152 @@ describe("verification policy", () => {
   });
 });
 
+describe("Signature-Agent field lines", () => {
+  function descriptorRequest(
+    agentLines: string[],
+    extraFields: { name: string; value: string }[] = []
+  ) {
+    return {
+      kind: "request",
+      method: "GET",
+      targetUri: "https://example.com/",
+      fields: [
+        ...agentLines.map((value) => ({ name: "signature-agent", value })),
+        ...extraFields,
+      ],
+    } satisfies import("http-message-sig").RequestDescriptor;
+  }
+
+  function signedDescriptor(agentLines: string[], fields: SignatureFields) {
+    return descriptorRequest(agentLines, [
+      { name: "signature", value: fields.signature },
+      { name: "signature-input", value: fields.signatureInput },
+    ]);
+  }
+
+  it("authenticates the replacing member across field lines", async () => {
+    const signer = await signerFromJWK(ed25519Jwk);
+    const verifier = await verifierFromJWK(ed25519Jwk);
+    const agentLines = [
+      'agent1="https://unsigned.example"',
+      'agent1="https://signed.example"',
+    ];
+    const request = descriptorRequest(agentLines);
+    const fields = await sign(request, {
+      signer,
+      created,
+      expires,
+      signatureAgentKey: "agent1",
+    });
+    const resolver = vi.fn(() => verifier);
+    const result = await verify(signedDescriptor(agentLines, fields), {
+      resolver,
+      now,
+    });
+    expect(result.signatureAgent?.uri).toBe("https://signed.example");
+    expect(resolver).toHaveBeenCalledWith(
+      expect.objectContaining({
+        signatureAgent: expect.objectContaining({
+          uri: "https://signed.example",
+        }),
+      })
+    );
+  });
+
+  it("rejects an unsupported replacement instead of reviving the earlier URI", async () => {
+    const signer = await signerFromJWK(ed25519Jwk);
+    const agentLines = [
+      'agent1="https://unsigned.example"',
+      'agent1="https://signed.example";unknown',
+    ];
+    await expect(
+      sign(descriptorRequest(agentLines), {
+        signer,
+        created,
+        expires,
+        signatureAgentKey: "agent1",
+      })
+    ).rejects.toThrow("Signature-Agent has no supported member agent1");
+
+    // A signature covering the replacing member must not authenticate the
+    // earlier URI it replaced.
+    const fields = await createSignature(descriptorRequest(agentLines), {
+      signer,
+      components: [
+        "@authority",
+        component("signature-agent", { key: "agent1" }),
+      ],
+      parameters: {
+        created: Math.floor(created.getTime() / 1000),
+        expires: Math.floor(expires.getTime() / 1000),
+        keyid: signer.keyid,
+        alg: signer.algorithm,
+        tag: "web-bot-auth",
+      },
+    });
+    const resolver = vi.fn(() => verifierFromJWK(ed25519Jwk));
+    await expect(
+      verify(signedDescriptor(agentLines, fields), { resolver, now })
+    ).rejects.toMatchObject({
+      message: "Verifier resolution failed",
+      cause: { message: "Signature-Agent has no supported member agent1" },
+    });
+    expect(resolver).not.toHaveBeenCalled();
+  });
+
+  it("signs and verifies separate legacy field lines", async () => {
+    const signer = await signerFromJWK(ed25519Jwk);
+    const verifier = await verifierFromJWK(ed25519Jwk);
+    const agentLines = ['"https://one.example"', '"https://two.example"'];
+    const fields = await sign(descriptorRequest(agentLines), {
+      signer,
+      created,
+      expires,
+    });
+    expect(fields.signatureInput).toContain('"signature-agent"');
+    expect(fields.signatureInput).not.toContain('"signature-agent";key=');
+    await expect(
+      verify(signedDescriptor(agentLines, fields), {
+        resolver: () => verifier,
+        now,
+      })
+    ).resolves.toMatchObject({
+      signatureAgent: { uri: "https://one.example" },
+    });
+  });
+
+  it("rejects mixed legacy and dictionary field lines", async () => {
+    const signer = await signerFromJWK(ed25519Jwk);
+    const verifier = await verifierFromJWK(ed25519Jwk);
+    for (const agentLines of [
+      ['"https://legacy.example"', 'sig1="https://current.example"'],
+      ['sig1="https://current.example"', '"https://legacy.example"'],
+    ]) {
+      await expect(
+        sign(descriptorRequest(agentLines), { signer, created, expires })
+      ).rejects.toThrow();
+
+      const fields = await createSignature(descriptorRequest(agentLines), {
+        signer,
+        components: ["@authority"],
+        parameters: {
+          created: Math.floor(created.getTime() / 1000),
+          expires: Math.floor(expires.getTime() / 1000),
+          keyid: signer.keyid,
+          alg: signer.algorithm,
+          tag: "web-bot-auth",
+        },
+      });
+      await expect(
+        verify(signedDescriptor(agentLines, fields), {
+          resolver: () => verifier,
+          now,
+        })
+      ).rejects.toThrow();
+    }
+  });
+});
+
 describe("JWK binding", () => {
   it("rejects conflicting JWK alg", async () => {
     await expect(

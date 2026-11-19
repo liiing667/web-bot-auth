@@ -140,63 +140,86 @@ function validateDiscoveryURI(uri: string) {
   }
 }
 
+function signatureAgentDictionaryEntries(
+  dictionary: ReturnType<typeof parseDictionary>
+): SignatureAgentEntry[] {
+  if (dictionary.size === 0) {
+    throw new Error("Signature-Agent header must not be empty");
+  }
+  const entries: SignatureAgentEntry[] = [];
+  for (const [label, value] of dictionary) {
+    const [uri, params] = value;
+    if (typeof uri !== "string") {
+      throw new Error("Signature-Agent values must be strings");
+    }
+    const type = params.get("type");
+    if (
+      params.size !== 0 &&
+      !(
+        params.size === 1 &&
+        type instanceof Token &&
+        type.toString() === "cimd"
+      )
+    ) {
+      continue;
+    }
+    validateDiscoveryURI(uri);
+    entries.push(
+      type === undefined ? { label, uri } : { label, uri, type: "cimd" }
+    );
+  }
+  return entries;
+}
+
+function parseSignatureAgentLegacyLine(line: string): SignatureAgentEntry {
+  const [uri, params] = parseItem(line);
+  if (typeof uri !== "string") {
+    throw new Error("legacy Signature-Agent must be a string");
+  }
+  if (params.size !== 0)
+    throw new Error("legacy Signature-Agent must not carry parameters");
+  validateDiscoveryURI(uri);
+  return { label: "", uri };
+}
+
+/**
+ * Parse Signature-Agent field lines as their comma-joined value.
+ *
+ * Later members replace earlier ones before validation. Ignoring an
+ * unsupported replacement must not revive an earlier URI that the selected
+ * dictionary member no longer covers. Separate legacy sf-string field lines
+ * remain supported for backwards compatibility; mixing legacy and dictionary
+ * lines is rejected.
+ */
+export function parseSignatureAgentHeaderLines(
+  lines: readonly string[]
+): SignatureAgentHeader {
+  if (lines.length === 0) {
+    throw new Error("Signature-Agent header must not be empty");
+  }
+  // Dictionary keys cannot start with a quote, only legacy sf-strings can.
+  if (lines.every((line) => line.trimStart().startsWith('"'))) {
+    return {
+      kind: "legacy",
+      entries: lines.map(parseSignatureAgentLegacyLine),
+    };
+  }
+  const dictionary: ReturnType<typeof parseDictionary> = new Map();
+  for (const line of lines) {
+    for (const [label, member] of parseDictionary(line)) {
+      dictionary.set(label, member);
+    }
+  }
+  return {
+    kind: "current",
+    entries: signatureAgentDictionaryEntries(dictionary),
+  };
+}
+
 export function parseSignatureAgentHeader(
   header: string
 ): SignatureAgentHeader {
-  try {
-    const dictionary = parseDictionary(header);
-    if (dictionary.size === 0) {
-      throw new Error("Signature-Agent header must not be empty");
-    }
-    const entries: SignatureAgentEntry[] = [];
-    for (const [label, value] of dictionary) {
-      const [uri, params] = value;
-      if (typeof uri !== "string") {
-        throw new Error("Signature-Agent values must be strings");
-      }
-      const type = params.get("type");
-      if (
-        params.size !== 0 &&
-        !(
-          params.size === 1 &&
-          type instanceof Token &&
-          type.toString() === "cimd"
-        )
-      ) {
-        continue;
-      }
-      validateDiscoveryURI(uri);
-      entries.push(
-        type === undefined ? { label, uri } : { label, uri, type: "cimd" }
-      );
-    }
-    return { kind: "current", entries };
-  } catch (dictionaryError) {
-    try {
-      const [uri, params] = parseItem(header);
-      if (typeof uri !== "string") {
-        throw new Error("legacy Signature-Agent must be a string", {
-          cause: dictionaryError,
-        });
-      }
-      if (params.size !== 0)
-        throw new Error("legacy Signature-Agent must not carry parameters");
-      validateDiscoveryURI(uri);
-      return {
-        kind: "legacy",
-        entries: [{ label: "", uri }],
-      };
-    } catch (itemError) {
-      throw new Error(
-        `failed to parse Signature-Agent header: ${errorMessage(dictionaryError)}; ${errorMessage(itemError)}`,
-        { cause: itemError }
-      );
-    }
-  }
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  return parseSignatureAgentHeaderLines([header]);
 }
 
 function stripRegistryComment(line: string): string {

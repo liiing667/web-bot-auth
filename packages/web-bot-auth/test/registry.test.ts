@@ -3,6 +3,7 @@ import {
   parseRegistry,
   parseSignatureAgentCard,
   parseSignatureAgentHeader,
+  parseSignatureAgentHeaderLines,
 } from "../src/index";
 
 import cardVectors from "./test_data/web_bot_auth_signature_agent_card_v1.json";
@@ -42,6 +43,52 @@ describe("Signature-Agent invalid syntax", () => {
           },
         ],
       }
+    );
+  });
+});
+
+describe("Signature-Agent field lines", () => {
+  it("parses separate legacy field lines", () => {
+    expect(
+      parseSignatureAgentHeaderLines([
+        '"https://one.example"',
+        '"https://two.example"',
+      ])
+    ).toEqual({
+      kind: "legacy",
+      entries: [
+        { label: "", uri: "https://one.example" },
+        { label: "", uri: "https://two.example" },
+      ],
+    });
+  });
+
+  it("replaces earlier members before validation", () => {
+    // An ignored unsupported replacement must not revive an earlier URI that
+    // the selected dictionary member no longer covers.
+    expect(
+      parseSignatureAgentHeaderLines([
+        'a="https://old.example", b="http://replaced.example"',
+        'a="https://ignored.example";unknown, b="https://new.example"',
+      ])
+    ).toEqual({
+      kind: "current",
+      entries: [{ label: "b", uri: "https://new.example" }],
+    });
+  });
+
+  it("rejects mixed legacy and dictionary field lines", () => {
+    for (const lines of [
+      ['"https://legacy.example"', 'a="https://current.example"'],
+      ['a="https://current.example"', '"https://legacy.example"'],
+    ]) {
+      expect(() => parseSignatureAgentHeaderLines(lines)).toThrow();
+    }
+  });
+
+  it("rejects empty field lines", () => {
+    expect(() => parseSignatureAgentHeaderLines([])).toThrow(
+      "must not be empty"
     );
   });
 });

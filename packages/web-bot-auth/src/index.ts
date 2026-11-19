@@ -20,6 +20,7 @@ import {
   parseRegistry,
   parseSignatureAgentCard,
   parseSignatureAgentHeader,
+  parseSignatureAgentHeaderLines,
   type JSONWebKeySet,
   type SignatureAgentCard,
   type SignatureAgentDiscoveryType,
@@ -33,6 +34,7 @@ export {
   parseRegistry,
   parseSignatureAgentCard,
   parseSignatureAgentHeader,
+  parseSignatureAgentHeaderLines,
   type JSONWebKeySet,
   type SignatureAgentCard,
   type SignatureAgentDiscoveryType,
@@ -164,17 +166,18 @@ export function validateNonce(nonce: unknown): nonce is string {
   );
 }
 
-function requestHeader(
+function requestHeaderLines(
   request: Request | RequestDescriptor,
   name: string
-): string | undefined {
+): string[] | undefined {
   if ("kind" in request) {
     const values = request.fields
       .filter((field) => field.name.toLowerCase() === name)
       .map((field) => field.value.trim());
-    return values.length === 0 ? undefined : values.join(", ");
+    return values.length === 0 ? undefined : values;
   }
-  return request.headers.get(name) ?? undefined;
+  const value = request.headers.get(name);
+  return value === null ? undefined : [value];
 }
 
 interface SignatureAgentSelection {
@@ -185,9 +188,9 @@ function signingSignatureAgent(
   request: Request | RequestDescriptor,
   key: string
 ): SignatureAgentSelection | undefined {
-  const header = requestHeader(request, SIGNATURE_AGENT_HEADER);
-  if (header === undefined) return undefined;
-  const parsed = parseSignatureAgentHeader(header);
+  const lines = requestHeaderLines(request, SIGNATURE_AGENT_HEADER);
+  if (lines === undefined) return undefined;
+  const parsed = parseSignatureAgentHeaderLines(lines);
   if (parsed.kind === "legacy") {
     const entry = parsed.entries[0];
     if (entry === undefined) return policyError("Signature-Agent is empty");
@@ -216,9 +219,9 @@ function verifiedSignatureAgent(
   request: Request | RequestDescriptor,
   components: readonly ComponentDescriptor[]
 ): SignatureAgentEntry | undefined {
-  const header = requestHeader(request, SIGNATURE_AGENT_HEADER);
-  if (header === undefined) return undefined;
-  const parsed = parseSignatureAgentHeader(header);
+  const lines = requestHeaderLines(request, SIGNATURE_AGENT_HEADER);
+  if (lines === undefined) return undefined;
+  const parsed = parseSignatureAgentHeaderLines(lines);
   if (parsed.kind === "legacy") {
     const covered = components.some(
       ({ name, parameters }) =>
