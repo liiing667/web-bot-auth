@@ -983,6 +983,12 @@ function assertPolicyCoverage<V extends Verifier>(
   }
   const created = parameters.created;
   const expires = parameters.expires;
+  if (created !== undefined && expires !== undefined && created > expires) {
+    fail(
+      SignatureErrorCode.PolicyViolation,
+      "created must not be after expires"
+    );
+  }
   if (created !== undefined && created > now + skew) {
     fail(
       SignatureErrorCode.PolicyViolation,
